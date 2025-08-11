@@ -1,78 +1,136 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
 const API_BASE = "http://localhost:3000/v1";
 
 export default function App() {
+  const [messages, setMessages] = useState([
+    { role: "assistant", content: "Hi! Ask about your notes (e.g., “What did I write on copywriting?”)." }
+  ]);
   const [input, setInput] = useState("");
-  const [answer, setAnswer] = useState("");
-  const [notes, setNotes] = useState([]);
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
+  const [lastNotes, setLastNotes] = useState([]); // supporting docs for last answer
+  const listRef = useRef(null);
 
-  async function ask() {
-    const q = input.trim();
-    if (!q) return;
-    setBusy(true); setErr(""); setAnswer(""); setNotes([]);
-    try {
-      const res = await fetch(`${API_BASE}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: q, k: 12 })
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error?.message || "chat failed");
-      setAnswer(data.answer || "No relevant notes found.");
-      setNotes(Array.isArray(data.notes) ? data.notes : []);
-    } catch (e) {
-      setErr(e.message);
-    } finally {
-      setBusy(false);
+  useEffect(() => {
+    // autoscroll to bottom
+    listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages, busy]);
+
+  const send = async () => {
+  const text = input.trim();
+  if (!text || busy) return;
+  setInput("");
+  setBusy(true);
+
+  // add user bubble
+  setMessages((m) => [...m, { role: "user", content: text }]);
+
+  try {
+    const res = await fetch(`${API_BASE}/route`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, k: 12 })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error?.message || "route failed");
+
+    if (data.action === "query") {
+      const ans = data.result?.answer || "No relevant notes found.";
+      setLastNotes(Array.isArray(data.result?.notes) ? data.result.notes : []);
+      setMessages((m) => [...m, { role: "assistant", content: ans }]);
+    } else if (data.action === "ingest") {
+      const chunks = data.result?.chunks ?? 0;
+      setLastNotes([]); // nothing to show in Sources for ingest
+      setMessages((m) => [
+        ...m,
+        { role: "assistant", content: `✅ Saved to notes (${chunks} chunk${chunks === 1 ? "" : "s"}).` }
+      ]);
+    } else {
+      setLastNotes([]);
+      setMessages((m) => [...m, { role: "assistant", content: "⚠️ Unknown action." }]);
     }
+  } catch (e) {
+    setMessages((m) => [...m, { role: "assistant", content: `⚠️ ${e.message}` }]);
+    setLastNotes([]);
+  } finally {
+    setBusy(false);
   }
+};
+
+  const onKey = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  };
 
   return (
-    <div style={{ fontFamily: "system-ui, Segoe UI, Arial", padding: 16, maxWidth: 1000, margin: "0 auto" }}>
-      <h1>SecondBrain — Chat</h1>
+    <div className="shell">
+      <header className="topbar">
+        <div className="brand">SecondBrain</div>
+      </header>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: 16 }}>
-        {/* Left: Chat */}
-        <div style={{ border: "1px solid #e3e3e3", borderRadius: 12, padding: 16 }}>
-          <div style={{ display: "flex", gap: 8 }}>
-            <input
+      <main className="main">
+        {/* chat column */}
+        <section className="chat">
+          <div className="msgs" ref={listRef}>
+            {messages.map((m, i) => (
+              <Message key={i} role={m.role} text={m.content} />
+            ))}
+            {busy && <Message role="assistant" text="Thinking…" />}
+          </div>
+
+          <div className="composer">
+            <textarea
+              className="input"
+              placeholder='Ask something… (Shift+Enter for newline)'
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && ask()}
-              placeholder='Ask: "What did I write on copywriting?"'
-              style={{ flex: 1, padding: 10, borderRadius: 10, border: "1px solid #ccc" }}
+              onKeyDown={onKey}
+              rows={1}
             />
-            <button onClick={ask} disabled={busy || !input.trim()} style={{ padding: "10px 16px", borderRadius: 10 }}>
+            <button className="send" onClick={send} disabled={busy || !input.trim()}>
               {busy ? "…" : "Send"}
             </button>
           </div>
+        </section>
 
-          {err && <p style={{ color: "#b91c1c", marginTop: 8 }}>✖ {err}</p>}
-          {!!answer && (
-            <div style={{ marginTop: 12, padding: 12, border: "1px solid #eee", borderRadius: 8, background: "#fafafa" }}>
-              <strong>Answer</strong>
-              <div style={{ marginTop: 6 }}>{answer}</div>
-            </div>
-          )}
-        </div>
-
-        {/* Right: Supporting notes */}
-        <div style={{ border: "1px solid #e3e3e3", borderRadius: 12, padding: 16 }}>
-          <h3>Relevant Notes</h3>
-          {!notes.length && <p style={{ color: "#666" }}>No matches yet.</p>}
-          {notes.map((it) => (
-            <div key={it.item_id} style={{ padding: 12, border: "1px solid #eee", borderRadius: 8, marginBottom: 8 }}>
-              <div style={{ fontSize: 12, opacity: 0.7 }}>item {it.item_id}</div>
-              <div style={{ fontWeight: 600 }}>{it.title || "(untitled)"}</div>
-              <div>{it.chunks?.[0]?.text}</div>
+        {/* notes column */}
+        <aside className="notes">
+          <h3>Sources</h3>
+          {!lastNotes.length && <p className="muted">No sources yet. Ask a question.</p>}
+          {lastNotes.map((it) => (
+            <div key={it.item_id} className="note">
+              <div className="note_meta">
+                <span className="pill">{it.title || "(untitled)"}</span>
+                <span className="muted">item {it.item_id.slice(0, 6)}…</span>
+              </div>
+              <div className="note_txt">{it.chunks?.[0]?.text}</div>
+              {it.chunks?.length > 1 && (
+                <details className="more">
+                  <summary>More chunks ({it.chunks.length - 1})</summary>
+                  <ul>
+                    {it.chunks.slice(1).map((c, idx) => (
+                      <li key={idx} className="snippet">[{c.chunk_index}] {c.text}</li>
+                    ))}
+                  </ul>
+                </details>
+              )}
             </div>
           ))}
-        </div>
-      </div>
+        </aside>
+      </main>
+    </div>
+  );
+}
+
+function Message({ role, text }) {
+  const isUser = role === "user";
+  return (
+    <div className={`row ${isUser ? "user" : "assistant"}`}>
+      <div className="avatar">{isUser ? "🧑" : "🤖"}</div>
+      <div className="bubble">{text}</div>
     </div>
   );
 }

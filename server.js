@@ -140,6 +140,133 @@ function buildContext(items, maxChars = 4000) {
   return out;
 }
 
+// --- Minimal intent classifier (LLM → strict JSON)
+async function classifyIntent(input) {
+  const r = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0,
+    max_tokens: 100,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: "Classify the input. Output JSON only." },
+      { role: "user", content:
+`Input: ${input}
+
+Return:
+{
+  "intent": "ingest" | "query",
+  "title": string|null,
+  "text": string|null
+}
+
+Rules:
+- "ingest" when user is saving a note (e.g., "I met Jerry today in Sunburn.")
+- "query" when user is asking a question about notes.
+- For "ingest", set "text" to the note content, "title" short or null.
+- For "query", title=null, text=null.` }
+    ]
+  });
+
+  try {
+    const out = JSON.parse(r.choices[0].message.content);
+    if (out.intent !== "ingest" && out.intent !== "query") return { intent: "query", title: null, text: null };
+    return out;
+  } catch {
+    return { intent: "query", title: null, text: null };
+  }
+}
+
+// --- Tiny retrieval used for query branch (no external deps)
+async function retrieveForQuery(query, { k = 12, score_threshold = 0.2 } = {}) {
+  const [qvec] = await embedBatch([query]);
+  const hits = await qdrant.search(COLLECTION, {
+    vector: qvec,
+    limit: k,
+    score_threshold,
+    with_payload: true
+  });
+
+  // group by item_id and sort
+  const byItem = new Map();
+  for (const h of hits) {
+    const p = h.payload || {};
+    if (!p.item_id) continue;
+    const it = byItem.get(p.item_id) || { item_id: p.item_id, title: p.title ?? null, chunks: [], top: 0 };
+    it.chunks.push({ text: p.text, chunk_index: p.chunk_index, score: h.score });
+    it.top = Math.max(it.top, h.score);
+    byItem.set(p.item_id, it);
+  }
+  return Array.from(byItem.values())
+    .map(i => ({ ...i, chunks: i.chunks.sort((a,b)=>b.score-a.score) }))
+    .sort((a,b)=>b.top - a.top);
+}
+
+// --- Build compact context string for LLM
+function buildCtx(items, maxChars = 4000) {
+  let out = "";
+  for (const it of items) {
+    for (const c of it.chunks) {
+      const block = `Title: ${it.title ?? "(untitled)"} | Chunk ${c.chunk_index} | Score ${c.score.toFixed(3)}\n${c.text}\n---\n`;
+      if (out.length + block.length > maxChars) return out;
+      out += block;
+    }
+  }
+  return out;
+}
+
+// POST /v1/route  { text: string, k?: number }
+api.post("/route", async (req, res) => {
+  const input = String(req.body?.text || "");
+  const k = Math.max(1, Math.min(Number(req.body?.k || 12), 50));
+  if (!input) return res.status(400).json({ error: { code: "bad_request", message: "text required" } });
+
+  try {
+    // 1) classify
+    const cls = await classifyIntent(input);
+
+    if (cls.intent === "ingest") {
+      // 2a) ingest note (reuse your existing helpers)
+      const text = (cls.text || input).trim();
+      const title = (cls.title || null);
+      const itemId = crypto.randomUUID();
+      const baseHash = contentHash(text, {});
+      const chunks = chunkText(text);
+      const embs = await embedBatch(chunks.map(c => c.text));
+      const points = chunks.map((c, i) => ({
+        id: crypto.randomUUID(),
+        vector: embs[i],
+        payload: {
+          item_id: itemId, title, chunk_index: c.idx, text: c.text,
+          tokens: c.tokens, metadata: {}, embedding_model: EMBED_MODEL, content_hash: baseHash
+        }
+      }));
+      await qdrant.upsert(COLLECTION, { points });
+      return res.json({ action: "ingest", result: { item_id: itemId, chunks: points.length, status: "persisted" } });
+    }
+
+    // 2b) answer query (retrieve → summarize)
+    const items = await retrieveForQuery(input, { k, score_threshold: 0.2 });
+    const ctx = buildCtx(items, 4000);
+    if (!ctx) return res.json({ action: "query", result: { answer: "No relevant notes found.", notes: items } });
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      max_tokens: 400,
+      messages: [
+        { role: "system", content: "Answer strictly using the provided notes. Be concise. If nothing relevant, say 'No relevant notes found.' Cite titles/chunk indexes when helpful." },
+        { role: "user", content: `Question:\n${input}\n\nNotes:\n${ctx}` }
+      ]
+    });
+
+    const answer = completion.choices?.[0]?.message?.content?.trim() || "No response.";
+    return res.json({ action: "query", result: { answer, notes: items, usage: completion.usage ?? null } });
+  } catch (e) {
+    console.error("[ROUTE] error", e);
+    return res.status(500).json({ error: { code: "internal_error", message: "route failed", detail: String(e?.message || e) } });
+  }
+});
+
 
 // Health
 api.get("/health", (_req, res) => res.json({ ok: true }));
