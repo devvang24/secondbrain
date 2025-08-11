@@ -1,60 +1,74 @@
 // server.js
 import "dotenv/config";
 import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import compression from "compression";
+import rateLimit from "express-rate-limit";
 import crypto from "crypto";
 import OpenAI from "openai";
 import { QdrantClient } from "@qdrant/js-client-rest";
 
-// --- Boot logging
-const bootStartedAtMs = Date.now();
-console.log(`[BOOT] server.js starting @ ${new Date().toISOString()} cwd=${process.cwd()} node=${process.version}`);
-console.log("[ENV] summary", {
-  PORT: process.env.PORT || null,
-  OPENAI_API_KEY: process.env.OPENAI_API_KEY ? `set(len=${process.env.OPENAI_API_KEY.length})` : "missing",
-  QDRANT_URL: process.env.QDRANT_URL || "missing",
-  QDRANT_COLLECTION: process.env.QDRANT_COLLECTION || "secondbrain(default)"
+// ----- Boot info
+const bootStartedAt = Date.now();
+const PORT = Number(process.env.PORT || 3000);
+const QDRANT_URL = process.env.QDRANT_URL;
+const COLLECTION = process.env.QDRANT_COLLECTION || "secondbrain";
+const EMBED_MODEL = "text-embedding-3-small"; // 1536 dims
+
+console.log("[BOOT]", {
+  node: process.version,
+  port: PORT,
+  qdrant: QDRANT_URL,
+  collection: COLLECTION,
+  openaiKey: process.env.OPENAI_API_KEY ? `set(len=${process.env.OPENAI_API_KEY.length})` : "missing"
 });
 
+// ----- App + middleware
 const app = express();
+app.set("trust proxy", 1);
+app.use(helmet());
+app.use(compression());
 app.use(express.json({ limit: "2mb" }));
-// Request/response logger
+
+// CORS (web frontends); RN ignores CORS
+const allowlist = new Set([
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000"
+]);
+app.use(
+  cors({
+    origin: (origin, cb) => (!origin ? cb(null, true) : cb(null, allowlist.has(origin))),
+    credentials: false
+  })
+);
+
+// Basic rate limit
+app.use(rateLimit({ windowMs: 60_000, max: 240 }));
+
+// Tiny request logger
 app.use((req, res, next) => {
-  const startedAt = Date.now();
-  let bodyLen = 0;
-  try {
-    if (typeof req.body === "string") bodyLen = req.body.length;
-    else bodyLen = Buffer.byteLength(JSON.stringify(req.body ?? {}));
-  } catch {
-    bodyLen = -1;
-  }
-  console.log(`[REQ] ${req.method} ${req.originalUrl} bodyLen=${bodyLen}`);
+  const t0 = Date.now();
   res.on("finish", () => {
-    console.log(`[RES] ${req.method} ${req.originalUrl} status=${res.statusCode} durMs=${Date.now() - startedAt}`);
+    console.log(`[REQ] ${req.method} ${req.originalUrl} -> ${res.statusCode} ${Date.now() - t0}ms`);
   });
   next();
 });
 
-// ---- Clients
+// ----- Clients
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-console.log(`[INIT] OpenAI client ${process.env.OPENAI_API_KEY ? "configured" : "MISSING_API_KEY"}`);
-const qdrant = new QdrantClient({ url: process.env.QDRANT_URL });
-console.log(`[INIT] Qdrant client url=${process.env.QDRANT_URL}`);
+const qdrant = new QdrantClient({ url: QDRANT_URL });
 
-const COLLECTION = process.env.QDRANT_COLLECTION || "secondbrain";
-const EMBED_MODEL = "text-embedding-3-small"; // 1536-dim
-console.log(`[CONFIG] COLLECTION=${COLLECTION} EMBED_MODEL=${EMBED_MODEL}`);
-
-// ---- Helpers
+// ----- Helper utils
 function contentHash(text, metadata = {}) {
-  console.log(`[FUNC] contentHash enter textLen=${text?.length ?? 0}`);
   const norm = text.trim() + "|" + JSON.stringify(metadata ?? {});
-  const hash = crypto.createHash("sha256").update(norm).digest("hex");
-  console.log(`[FUNC] contentHash exit hash=${hash.slice(0, 8)}...`);
-  return hash;
+  return crypto.createHash("sha256").update(norm).digest("hex");
 }
 function chunkText(text, max = 1000, overlap = 200) {
-  console.log(`[FUNC] chunkText enter textLen=${text?.length ?? 0} max=${max} overlap=${overlap}`);
-  const out = []; let i = 0, idx = 0;
+  const out = [];
+  let i = 0, idx = 0;
   while (i < text.length) {
     const end = Math.min(i + max, text.length);
     const seg = text.slice(i, end);
@@ -62,91 +76,62 @@ function chunkText(text, max = 1000, overlap = 200) {
     if (end === text.length) break;
     i = end - overlap; idx++;
   }
-  console.log(`[FUNC] chunkText exit chunks=${out.length}`);
   return out;
 }
 async function embedBatch(texts) {
-  console.log(`[FUNC] embedBatch enter count=${texts?.length ?? 0}`);
-  const t0 = Date.now();
-  try {
-    const res = await openai.embeddings.create({ model: EMBED_MODEL, input: texts });
-    console.log(`[FUNC] embedBatch exit count=${res.data?.length ?? 0} durMs=${Date.now() - t0}`);
-    return res.data.map(d => d.embedding);
-  } catch (e) {
-    console.error(`[FUNC] embedBatch error`, e);
-    throw e;
-  }
+  const r = await openai.embeddings.create({ model: EMBED_MODEL, input: texts });
+  return r.data.map(d => d.embedding);
 }
 
-// ---- Ensure collection exists on boot
+// ----- Ensure collection exists
 async function ensureCollection() {
-  console.log(`[BOOT] ensureCollection check name=${COLLECTION}`);
-  const dim = 1536;
+  const size = 1536;
   try {
     await qdrant.getCollection(COLLECTION);
-    console.log(`[BOOT] ensureCollection exists name=${COLLECTION}`);
-  } catch (e) {
-    console.warn(`[BOOT] ensureCollection missing; creating name=${COLLECTION}`);
-    try {
-      await qdrant.createCollection(COLLECTION, { vectors: { size: dim, distance: "Cosine" } });
-      console.log(`[BOOT] ensureCollection created name=${COLLECTION} dim=${dim}`);
-    } catch (ce) {
-      console.error(`[BOOT] ensureCollection create failed`, ce);
-      throw ce;
-    }
+    console.log("[QDRANT] collection exists:", COLLECTION);
+  } catch {
+    await qdrant.createCollection(COLLECTION, { vectors: { size, distance: "Cosine" } });
+    console.log("[QDRANT] collection created:", COLLECTION, "size", size);
   }
 }
 await ensureCollection();
-console.log(`[BOOT] ensureCollection complete`);
 
+// ----- Versioned API
+const api = express.Router();
 
-import path from "path";
-import { fileURLToPath } from "url";
+// Health
+api.get("/health", (_req, res) => res.json({ ok: true }));
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-console.log(`[INIT] Serving static from ${__dirname}`);
-app.use(express.static(__dirname));
-
-
-// ---- Health & Qdrant check
-app.get("/health", (_req, res) => {
-  console.log(`[ROUTE] GET /health`);
-  res.json({ ok: true });
+// Qdrant ping
+api.get("/vd-check", async (_req, res) => {
+  const c = await qdrant.getCollections();
+  res.json({ qdrant: "up", collections: (c.collections || []).map(x => x.name) });
 });
-app.get("/vd-check", async (_req, res) => {
-  console.log(`[ROUTE] GET /vd-check`);
+
+// Debug: embeddings
+api.get("/debug/embed", async (_req, res) => {
   try {
-    const c = await qdrant.getCollections();
-    const names = c.collections?.map(x => x.name) ?? [];
-    console.log(`[VD] collections=${names.length}`);
-    res.json({ qdrant: "up", collections: names });
+    const r = await openai.embeddings.create({ model: EMBED_MODEL, input: ["ping"] });
+    res.json({ ok: true, dims: r.data[0].embedding.length });
   } catch (e) {
-    console.error(`[VD] error`, e);
-    res.status(500).json({ qdrant: "down", error: String(e) });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// ---- Ingest: chunk -> embed -> upsert to Qdrant
-app.post("/ingest", async (req, res) => {
+// ---- POST /v1/nodes  (ingest)
+api.post("/nodes", async (req, res) => {
   const { text, title = null, metadata = {} } = req.body ?? {};
-  console.log(`[ROUTE] POST /ingest textLen=${typeof text === "string" ? text.length : 0} title=${title ?? ""}`);
-  if (!text || typeof text !== "string") {
-    console.log(`[INGEST] invalid text`);
-    return res.status(400).json({ error: "text required" });
-  }
+  if (!text || typeof text !== "string") return res.status(400).json({ error: { code: "bad_request", message: "text required" } });
 
   try {
     const itemId = crypto.randomUUID();
-    console.log(`[INGEST] itemId=${itemId}`);
     const baseHash = contentHash(text, metadata);
     const chunks = chunkText(text);
-    console.log(`[INGEST] chunks=${chunks.length}`);
-    const tEmb = Date.now();
     const embs = await embedBatch(chunks.map(c => c.text));
-    console.log(`[INGEST] embeddings ready vectors=${embs.length} durMs=${Date.now() - tEmb}`);
 
+    // Deterministic point IDs => same content overwrites (de-dupe)
     const points = chunks.map((c, i) => ({
-  id: crypto.randomUUID(), // <-- instead of sha256 hex
+  id: crypto.randomUUID(),            // ← replace the sha256 hex with this
   vector: embs[i],
   payload: {
     item_id: itemId,
@@ -160,39 +145,28 @@ app.post("/ingest", async (req, res) => {
   }
 }));
 
-
-    console.log(`[INGEST] upserting points=${points.length} into collection=${COLLECTION}`);
-    const tUp = Date.now();
     await qdrant.upsert(COLLECTION, { points });
-    console.log(`[INGEST] upsert complete durMs=${Date.now() - tUp}`);
-    res.json({ item_id: itemId, chunks: chunks.length, status: "persisted" });
+    res.json({ item_id: itemId, chunks: points.length, status: "persisted" });
   } catch (e) {
-    console.error(`[INGEST] error`, e);
-    res.status(500).json({ error: "internal_error" });
+    console.error("[INGEST] error", e);
+    res.status(500).json({ error: { code: "internal_error", message: "ingest failed" } });
   }
 });
 
-// ---- Search: embed query -> vector search
-app.get("/search", async (req, res) => {
+// ---- GET /v1/search?q=&k=
+api.get("/search", async (req, res) => {
   const q = String(req.query.q || "");
-  const k = Number(req.query.k || 5);
-  console.log(`[ROUTE] GET /search qLen=${q.length} k=${k}`);
-  if (!q) {
-    console.log(`[SEARCH] missing q`);
-    return res.status(400).json({ error: "q required" });
-  }
+  const k = Math.max(1, Math.min(Number(req.query.k || 5), 50));
+  if (!q) return res.status(400).json({ error: { code: "bad_request", message: "q required" } });
 
   try {
-    const tEmb = Date.now();
     const [qvec] = await embedBatch([q]);
-    console.log(`[SEARCH] query embedded durMs=${Date.now() - tEmb}`);
-    const tSearch = Date.now();
     const hits = await qdrant.search(COLLECTION, {
       vector: qvec,
       limit: k,
-      with_payload: true
+      with_payload: true,
+      score_threshold: 0.2 // tighten if needed
     });
-    console.log(`[SEARCH] completed hits=${hits?.length ?? 0} durMs=${Date.now() - tSearch}`);
     const out = hits.map(h => ({
       score: h.score,
       item_id: h.payload.item_id,
@@ -202,32 +176,66 @@ app.get("/search", async (req, res) => {
     }));
     res.json(out);
   } catch (e) {
-    console.error(`[SEARCH] error`, e);
-    res.status(500).json({ error: "internal_error" });
+    console.error("[SEARCH] error", e);
+    res.status(500).json({ error: { code: "internal_error", message: "search failed" } });
   }
 });
 
-app.get("/debug/embed", async (_req, res) => {
+// ---- GET /v1/nodes?limit=&offset=   (simple list)
+api.get("/nodes", async (req, res) => {
   try {
-    const r = await openai.embeddings.create({ model: EMBED_MODEL, input: ["ping"] });
-    res.json({ ok: true, dims: r.data[0].embedding.length });
+    const limit = Math.min(Number(req.query.limit ?? 20), 100);
+    const offset = Number(req.query.offset ?? 0);
+
+    // Scroll some points (MVP). For a real app, keep a separate "items" collection.
+    const r = await qdrant.scroll(COLLECTION, {
+      limit: limit + offset,
+      with_payload: true
+    });
+    const pts = r.points ?? [];
+
+    // Group by item_id; choose lowest chunk_index as preview
+    const byItem = new Map();
+    for (const p of pts) {
+      const pid = p.payload?.item_id;
+      if (!pid) continue;
+      const prev = byItem.get(pid);
+      if (!prev || (p.payload.chunk_index ?? 0) < (prev.payload.chunk_index ?? 0)) {
+        byItem.set(pid, p);
+      }
+    }
+
+    const items = Array.from(byItem.values())
+      .slice(offset, offset + limit)
+      .map(p => ({
+        item_id: p.payload.item_id,
+        title: p.payload.title ?? null,
+        preview: String(p.payload.text ?? "").slice(0, 180),
+        chunk_count: 1
+      }));
+
+    res.json(items);
   } catch (e) {
-    console.error("EMBED ERROR:", e);
-    res.status(500).json({ ok: false, detail: String(e?.message || e) });
+    console.error("[NODES_LIST] error", e);
+    res.status(500).json({ error: { code: "internal_error", message: "list failed" } });
   }
 });
 
+// Mount versioned API
+app.use("/v1", api);
 
-const port = Number(process.env.PORT || 3000);
-app.listen(port, () => {
-  console.log(`API ready on :${port}`);
-  console.log(`[BOOT] ready in ${Date.now() - bootStartedAtMs}ms`);
+// 404 + error handlers
+app.use((req, res) => res.status(404).json({ error: { code: "not_found", message: "Route not found" } }));
+app.use((err, _req, res, _next) => {
+  console.error("[UNCAUGHT]", err);
+  res.status(500).json({ error: { code: "internal_error", message: "Unexpected error" } });
 });
 
-// Global error handlers
-process.on("unhandledRejection", (reason) => {
-  console.error("[UNHANDLED_REJECTION]", reason);
+// Start
+app.listen(PORT, () => {
+  console.log(`API ready on :${PORT} in ${Date.now() - bootStartedAt}ms`);
 });
-process.on("uncaughtException", (err) => {
-  console.error("[UNCAUGHT_EXCEPTION]", err);
-});
+
+// Safety nets
+process.on("unhandledRejection", r => console.error("[unhandledRejection]", r));
+process.on("uncaughtException", e => console.error("[uncaughtException]", e));
