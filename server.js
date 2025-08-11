@@ -99,6 +99,48 @@ await ensureCollection();
 // ----- Versioned API
 const api = express.Router();
 
+// --- Retrieval helpers (server-side RAG)
+async function retrieveChunks(query, { k = 12, score_threshold = 0.2 } = {}) {
+  const [qvec] = await embedBatch([query]);
+  const hits = await qdrant.search(COLLECTION, {
+    vector: qvec,
+    limit: k,
+    score_threshold,
+    with_payload: true
+  });
+
+  // Group by item_id
+  const byItem = new Map();
+  for (const h of hits) {
+    const p = h.payload || {};
+    const id = p.item_id;
+    if (!id) continue;
+    const entry = byItem.get(id) || { item_id: id, title: p.title ?? null, chunks: [], topScore: h.score };
+    entry.chunks.push({ text: p.text, chunk_index: p.chunk_index, score: h.score });
+    entry.topScore = Math.max(entry.topScore, h.score);
+    byItem.set(id, entry);
+  }
+
+  // Sort items by best score; sort each item's chunks by score
+  return Array.from(byItem.values())
+    .map(it => ({ ...it, chunks: it.chunks.sort((a,b)=>b.score-a.score) }))
+    .sort((a,b)=>b.topScore - a.topScore);
+}
+
+function buildContext(items, maxChars = 4000) {
+  // Flatten top chunks into a single context string with a char budget
+  let out = "";
+  for (const it of items) {
+    for (const c of it.chunks) {
+      const block = `Title: ${it.title ?? "(untitled)"} | Chunk ${c.chunk_index} | Score ${c.score.toFixed(3)}\n${c.text}\n---\n`;
+      if (out.length + block.length > maxChars) return out;
+      out += block;
+    }
+  }
+  return out;
+}
+
+
 // Health
 api.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -117,6 +159,53 @@ api.get("/debug/embed", async (_req, res) => {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
+// POST /v1/chat  { query: string, k?: number, mode?: "answer"|"notes" }
+api.post("/chat", async (req, res) => {
+  const query = String(req.body?.query || "");
+  const k = Math.max(1, Math.min(Number(req.body?.k || 12), 50));
+  const mode = (req.body?.mode === "notes") ? "notes" : "answer";
+  if (!query) return res.status(400).json({ error: { code: "bad_request", message: "query required" } });
+
+  try {
+    // 1) Retrieve relevant chunks from Qdrant
+    const items = await retrieveChunks(query, { k, score_threshold: 0.2 });
+
+    // If caller only wants the notes, return early
+    if (mode === "notes") return res.json({ answer: null, notes: items });
+
+    // 2) Build compact context for LLM
+    const context = buildContext(items, 4000);
+
+    // If nothing relevant, reply simply
+    if (!context) return res.json({ answer: "No relevant notes found.", notes: items });
+
+    // 3) Ask LLM to summarize/answer using only provided notes
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      max_tokens: 400,
+      messages: [
+        { role: "system",
+          content: "Answer strictly using the provided notes. Be concise. If nothing relevant, say 'No relevant notes found.' Cite titles/chunk indexes when helpful." },
+        { role: "user",
+          content: `Question:\n${query}\n\nNotes:\n${context}` }
+      ]
+    });
+
+    const answer = completion.choices?.[0]?.message?.content?.trim() || "No response.";
+    res.json({
+      answer,
+      notes: items,
+      usage: completion.usage ?? null,
+      model: completion.model ?? "gpt-4o-mini"
+    });
+  } catch (e) {
+    console.error("[CHAT] error", e);
+    res.status(500).json({ error: { code: "internal_error", message: "chat failed", detail: String(e?.message || e) } });
+  }
+});
+
 
 // ---- POST /v1/nodes  (ingest)
 api.post("/nodes", async (req, res) => {
